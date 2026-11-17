@@ -22,7 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Default value of SolverMemoryThreshold in include/swift/Basic/LangOptions.h, per release tag.
 KNOWN_MEMORY_LIMITS_MB = {(6, 2): 512, (6, 3): 564, (6, 4): 512}
@@ -35,6 +35,7 @@ SKIPPED_DIRS = {
     ".git", ".build", ".swiftpm", "DerivedData", "SourcePackages", "checkouts", "Pods",
     "Carthage", "node_modules", ".typecheck-budget",
 }
+MANIFEST_RE = re.compile(r"^Package(@swift-[0-9.]+)?\.swift$")
 
 FUNC_RE = re.compile(r"^(\d+(?:\.\d+)?)ms\t(/[^\t]+?\.swift):(\d+):\d+\t(.*)$")
 ERROR_RE = re.compile(r"^(/[^\n]+?\.swift):(\d+):(\d+): error: (.*)$")
@@ -59,8 +60,11 @@ def fmt_int(n):
     return f"{n:,}"
 
 
+MB = 1024 * 1024
+
+
 def fmt_mb(b):
-    return f"{b / 1e6:,.1f} MB"
+    return f"{b / MB:,.1f} MB"
 
 
 def risk(pct):
@@ -106,7 +110,7 @@ def swift_files(root):
             if d not in SKIPPED_DIRS and not d.startswith(".") and not d.endswith((".xcodeproj", ".xcworkspace"))
         ]
         for name in filenames:
-            if name.endswith(".swift"):
+            if name.endswith(".swift") and not MANIFEST_RE.match(name):
                 yield Path(dirpath) / name
 
 
@@ -314,7 +318,7 @@ def hints(path):
 
 def make_report(mode, root, version_str, limit_mb, limit_note, stats, functions, errors, compiled, status,
                 compiled_targets, min_ms=1000.0):
-    limit_bytes = limit_mb * 1024 * 1024
+    limit_bytes = limit_mb * MB
     target_module = {}
     for rel, target in compiled_targets.items():
         module = functions.get(rel, {}).get("module")
@@ -563,16 +567,17 @@ def cmd_compare(args):
     for path in set(A) | set(B):
         x, y = A.get(path), B.get(path)
         delta = (y["solver_bytes"] if y else 0) - (x["solver_bytes"] if x else 0)
-        rows.append((abs(delta), path, x, y, delta))
-    rows.sort(key=lambda r: -r[0])
+        weight = max(x["pct"] if x else 0.0, y["pct"] if y else 0.0)
+        rows.append((abs(delta), path, x, y, delta, weight))
+    rows.sort(key=lambda r: (-r[0], -r[5], r[1]))
     print(f"before: {args.before}  ({a['created']}, Swift {a['swift']})")
     print(f"after:  {args.after}  ({b['created']}, Swift {b['swift']})\n")
     print(f"{'before':>20}  {'after':>20}  {'change':>11}  file")
-    for _, path, x, y, delta in rows[: args.top]:
+    for _, path, x, y, delta, _ in rows[: args.top]:
         xs = f"{fmt_mb(x['solver_bytes'])} {x['pct']:5.1f}%" if x else "-"
         ys = f"{fmt_mb(y['solver_bytes'])} {y['pct']:5.1f}%" if y else "-"
         sign = "+" if delta > 0 else ""
-        print(f"{xs:>20}  {ys:>20}  {sign}{delta / 1e6:>9,.1f} MB  {path}")
+        print(f"{xs:>20}  {ys:>20}  {sign}{delta / MB:>9,.1f} MB  {path}")
     def worst(r):
         return max((f["pct"] for f in r["files"]), default=0.0)
     print(f"\nworst file: {worst(a):.1f}% -> {worst(b):.1f}% of the limit; "

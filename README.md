@@ -15,10 +15,10 @@ your project once with the compiler's own statistics turned on and ranks every f
 of that budget it used.
 
 ```
-typecheck-budget 0.1.0 · Swift 6.4.2 · solver memory limit 512 MB (compiler default) · 3 files
+typecheck-budget 0.1.1 · Swift 6.4.2 · solver memory limit 512 MB (compiler default) · 3 files
 
   #  risk    solver peak  of limit      scopes  slowest body  file
-  1  HIGH       424.6 MB     79.1%     611,314   8,065 ms :7  Sources/App/SettingsView.swift
+  1  HIGH       404.9 MB     79.1%     611,314   8,065 ms :7  Sources/App/SettingsView.swift
   2  ok           0.6 MB      0.1%       4,703     8 ms :218  Sources/App/Features.swift
   3  ok           0.0 MB      0.0%         505       7 ms :7  Sources/App/ChildViews.swift
 
@@ -36,7 +36,7 @@ shows the same file in seconds:
 
 ```
 Sources/App/SettingsView.swift  ·  Swift 6.4.2  ·  limit 512 MB
-  solver peak          0.3 MB   was 424.6 MB (scan 2026-11-17T15:32:54)
+  solver peak          0.3 MB   was 404.9 MB (scan 2026-11-17T15:32:54)
   of limit               0.1%   was 79.1% (scan 2026-11-17T15:32:54)
   scopes                  312   was 611,314 (scan 2026-11-17T15:32:54)
   risk                     ok
@@ -123,7 +123,7 @@ Prints a saved report again, as the table or as Markdown for a pull request comm
 
 | Column | What it is |
 | --- | --- |
-| solver peak | `Sema.MaxSolverBytesAllocated`: the peak size of the solver's arena for the heaviest expression in the file. |
+| solver peak | `Sema.MaxSolverBytesAllocated`: the peak size of the solver's arena for the heaviest expression in the file. MB here are 1,048,576 bytes, the unit of the compiler's limit. |
 | of limit | That peak as a share of the compiler's memory limit: 512 MB in Swift 6.2 and 6.4, 564 MB in Swift 6.3. |
 | scopes | `Sema.NumConstraintScopes`: every attempt the solver made while checking the file, a measure of total work. |
 | slowest body | The slowest function body in the file and its line, from `-debug-time-function-bodies`. Start looking for the heavy expression there. The first function of every file also pays one-time work such as loading the imported modules, about 0.3-0.5 s, so a few hundred milliseconds there means nothing. |
@@ -163,7 +163,8 @@ all of them are recompiled, and puts the original times back afterwards. `file` 
 same times that build saw last time and bumps only the file you measure, so exactly one file is
 recompiled. In both cases your files end up with their real modification times, so Xcode's own
 build does not rebuild anything because of the tool. A file you edit while the tool runs keeps its
-new time. Hidden folders such as `.git` or `.build` are skipped.
+new time. Hidden folders such as `.git` or `.build` and package manifests (`Package.swift`) are
+skipped.
 
 The compiler writes one JSON file of statistics per compiled file. The tool reads two counters
 from it, takes the function timings and the "unable to type-check" errors from the build log, and
