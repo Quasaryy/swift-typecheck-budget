@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""typecheck-budget: find the Swift files closest to
+"the compiler is unable to type-check this expression in reasonable time".
+
+Commands:
+  scan     build the project and rank every Swift file by constraint solver memory
+  file     re-measure one file after an edit and compare it with the last scan
+  compare  diff two saved reports
+  show     print a saved report again (as a table or Markdown)
+
+Run `typecheck-budget <command> --help` for the options.
+"""
+
+import argparse
+import datetime
+import functools
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+# Default value of SolverMemoryThreshold in include/swift/Basic/LangOptions.h, per release tag.
+KNOWN_MEMORY_LIMITS_MB = {(6, 2): 512, (6, 3): 564, (6, 4): 512}
+FALLBACK_MEMORY_LIMIT_MB = 512
+
+HIGH_PCT = 25.0
+WATCH_PCT = 5.0
+
+SKIPPED_DIRS = {
+    ".git", ".build", ".swiftpm", "DerivedData", "SourcePackages", "checkouts", "Pods",
+    "Carthage", "node_modules", ".typecheck-budget",
+}
+
+FUNC_RE = re.compile(r"^(\d+(?:\.\d+)?)ms\t(/[^\t]+?\.swift):(\d+):\d+\t(.*)$")
+ERROR_RE = re.compile(r"^(/[^\n]+?\.swift):(\d+):(\d+): error: (.*)$")
+STATS_RE = re.compile(
+    r"^stats-\d+-swift-frontend-(?P<module>[A-Za-z0-9_]+)-(?P<file>.+?\.swift)-(?P<rest>.+)\.json$"
+)
+QUALIFIED_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\.\(file\)\.(.+)$")
+SWIFT_VERSION_RE = re.compile(r"Swift version (\d+)\.(\d+)(?:\.(\d+))?")
+TOO_COMPLEX = "unable to type-check this expression in reasonable time"
+
+INLINE_SCOPE_RE = re.compile(r"\$\w+\.scope\(\s*state:")
+NAV_ITEM_RE = re.compile(r"\.navigationDestination\(\s*item:")
+
+
+# ---------------------------------------------------------------- helpers
+
+def eprint(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def fmt_int(n):
+    return f"{n:,}"
+
+
+def fmt_mb(b):
+    return f"{b / 1e6:,.1f} MB"
+
+
+def risk(pct):
+    if pct >= HIGH_PCT:
+        return "HIGH"
+    if pct >= WATCH_PCT:
+        return "watch"
+    return "ok"
+
+
+def swift_version():
+    try:
+        out = subprocess.run(["xcrun", "swift", "--version"], capture_output=True, text=True).stdout
+    except OSError:
+        return None, ""
+    m = SWIFT_VERSION_RE.search(out)
+    if not m:
+        return None, out.strip().splitlines()[0] if out.strip() else ""
+    return (int(m.group(1)), int(m.group(2))), ".".join(g for g in m.groups() if g)
+
+
+def memory_limit_mb(version, override):
+    if override:
+        return override, "set with --limit-mb"
+    if version in KNOWN_MEMORY_LIMITS_MB:
+        return KNOWN_MEMORY_LIMITS_MB[version], "compiler default"
+    return FALLBACK_MEMORY_LIMIT_MB, "unknown compiler version, assumed; set --limit-mb to override"
+
+
+def short_name(qualified):
+    """'instance method App.(file).AccountView.body(content:)@/path...' -> 'AccountView.body(content:)'."""
+    qualified = qualified.split("@/", 1)[0]
+    m = QUALIFIED_RE.search(qualified)
+    if m:
+        return m.group(1), m.group(2)
+    return None, qualified
+
+
+def swift_files(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIPPED_DIRS and not d.startswith(".") and not d.endswith((".xcodeproj", ".xcworkspace"))
+        ]
+        for name in filenames:
+            if name.endswith(".swift"):
+                yield Path(dirpath) / name
+
+
+@functools.lru_cache(maxsize=None)
+def under_root(path, root):
+    try:
+        rel = Path(path).resolve().relative_to(root)
+    except ValueError:
+        return None
+    if any(part in SKIPPED_DIRS or part.startswith(".") for part in rel.parts):
+        return None
+    return rel.as_posix()
+
+
+class Mtimes:
+    """Gives source files the modification times the tool's own build should see, then puts the
+    real ones back, so the user's files and Xcode's own build are left as they were.
+
+    `plan` maps a path to the mtime (in ns) to use during the build, or to None for "now", which
+    makes the build recompile that file. A file edited while the build runs keeps its new mtime.
+    """
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.applied = {}
+
+    def __enter__(self):
+        for p, wanted in self.plan.items():
+            try:
+                st = os.stat(p)
+                if wanted is None:
+                    os.utime(p, None)
+                elif wanted != st.st_mtime_ns:
+                    os.utime(p, ns=(st.st_atime_ns, wanted))
+                else:
+                    continue
+                self.applied[p] = (st.st_atime_ns, st.st_mtime_ns, os.stat(p).st_mtime_ns)
+            except OSError:
+                pass
+        return self
+
+    def __exit__(self, *exc):
+        for p, (atime, original, used) in self.applied.items():
+            try:
+                if os.stat(p).st_mtime_ns == used:
+                    os.utime(p, ns=(atime, original))
+            except OSError:
+                pass
+        return False
+
+
+def load_seen(work):
+    """What the tool's build saw last time: path -> {"real": mtime_ns of the file, "seen": mtime_ns used}."""
+    try:
+        return json.loads((work / "mtimes.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_seen(work, root, applied, previous):
+    seen = {}
+    for p in swift_files(root):
+        p = str(p)
+        try:
+            current = os.stat(p).st_mtime_ns
+        except OSError:
+            continue
+        if p in applied:
+            _, original, used = applied[p]
+            if current == original:
+                seen[p] = {"real": original, "seen": used}
+                continue
+        old = previous.get(p)
+        if old and old["real"] == current and p not in applied:
+            seen[p] = old
+        else:
+            seen[p] = {"real": current, "seen": current}
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "mtimes.json").write_text(json.dumps(seen))
+
+
+# ---------------------------------------------------------------- build
+
+def build(args, plan, root):
+    work = Path(args.work_dir).resolve()
+    stats_dir = work / "stats"
+    log_path = work / "build.log"
+    if stats_dir.exists():
+        shutil.rmtree(stats_dir)
+    stats_dir.mkdir(parents=True)
+
+    user = [a for a in args.xcodebuild if a != "-quiet"]
+    if user != args.xcodebuild:
+        eprint("note: -quiet removed, the function timings are read from the build log")
+    if user and user[0] in ("build", "clean"):
+        user = user[1:]
+    cmd = ["xcodebuild", "build"] + user
+    if "-derivedDataPath" not in user:
+        cmd += ["-derivedDataPath", str(work / "DerivedData")]
+    cmd += ["-skipMacroValidation", "-skipPackagePluginValidation"]
+    flags = (
+        f'$(inherited) -Xfrontend -stats-output-dir -Xfrontend "{stats_dir}"'
+        " -Xfrontend -debug-time-function-bodies"
+    )
+    cmd += ["SWIFT_ENABLE_BATCH_MODE=NO", "COMPILER_INDEX_STORE_ENABLE=NO", f"OTHER_SWIFT_FLAGS={flags}"]
+
+    functions = {}
+    errors = []
+    compiled = 0
+    compiled_targets = {}
+    seen_paths = set()
+    eprint(f"building, full log: {log_path}")
+    with Mtimes(plan) as mtimes, open(log_path, "w") as log:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        for line in proc.stdout:
+            log.write(line)
+            if line.startswith("SwiftCompile "):
+                path, target = compile_line_path(line)
+                if path and path not in seen_paths:
+                    seen_paths.add(path)
+                    compiled += 1
+                    if compiled % 200 == 0:
+                        eprint(f"  {compiled} Swift files compiled so far")
+                    rel = under_root(path, root)
+                    if rel is not None:
+                        compiled_targets[rel] = target
+                continue
+            m = FUNC_RE.match(line)
+            if m:
+                rel = under_root(m.group(2), root)
+                if rel is None:
+                    continue
+                module, name = short_name(m.group(4))
+                entry = functions.setdefault(rel, {"module": module, "items": []})
+                if module and not entry["module"]:
+                    entry["module"] = module
+                entry["items"].append({"ms": float(m.group(1)), "line": int(m.group(3)), "name": name})
+                continue
+            m = ERROR_RE.match(line.rstrip("\n"))
+            if m and TOO_COMPLEX in m.group(4):
+                rel = under_root(m.group(1), root)
+                if rel is not None:
+                    errors.append({"path": rel, "line": int(m.group(2)), "message": m.group(4)})
+        status = proc.wait()
+    for rel in compiled_targets:
+        functions.setdefault(rel, {"module": None, "items": []})
+    return status, stats_dir, log_path, functions, errors, compiled, compiled_targets, mtimes.applied
+
+
+def compile_line_path(line):
+    """(absolute .swift path, target) from an xcodebuild 'SwiftCompile ...' line; spaces are escaped there."""
+    body, _, tail = line.rstrip("\n").partition(" (in target '")
+    target = tail.split("' from project", 1)[0] if tail else None
+    for token in reversed(re.split(r"(?<!\\) ", body)):
+        if token.startswith("/") and token.endswith(".swift"):
+            return token.replace("\\ ", " "), target
+    return None, target
+
+
+def stats_name(base):
+    """The compiler replaces characters such as '+' in the file name of its statistics file."""
+    return re.sub(r"[^A-Za-z0-9_.]", "_", base)
+
+
+def read_stats(stats_dir):
+    out = {}
+    for f in stats_dir.glob("*.json"):
+        m = STATS_RE.match(f.name)
+        if not m:
+            continue
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        rec = {
+            "scopes": int(d.get("Sema.NumConstraintScopes") or 0),
+            "solver_bytes": int(d.get("Sema.MaxSolverBytesAllocated") or 0),
+        }
+        key = (m.group("module"), stats_name(m.group("file")))
+        if key not in out or rec["solver_bytes"] > out[key]["solver_bytes"]:
+            out[key] = rec
+    return out
+
+
+def hints(path):
+    try:
+        text = Path(path).read_text(errors="replace")
+    except OSError:
+        return []
+    found = []
+    inline = len(INLINE_SCOPE_RE.findall(text))
+    nav = len(NAV_ITEM_RE.findall(text))
+    if inline >= 2:
+        found.append(
+            f"{inline} inline `$store.scope(state:action:)` calls: move them out of the modifier chain "
+            "(enum scope `$store.scope(\\.destination, action: \\.destination).case`, or a property with an explicit type)"
+        )
+    if nav >= 3:
+        found.append(
+            f"{nav} `.navigationDestination(item:)` calls: each one is an overload choice the solver revisits for "
+            "every other link; a modifier with a unique name that wraps it keeps the chain linear"
+        )
+    return found
+
+
+def make_report(mode, root, version_str, limit_mb, limit_note, stats, functions, errors, compiled, status,
+                compiled_targets, min_ms=1000.0):
+    limit_bytes = limit_mb * 1024 * 1024
+    target_module = {}
+    for rel, target in compiled_targets.items():
+        module = functions.get(rel, {}).get("module")
+        if module and target:
+            target_module.setdefault(target, module)
+    by_name = {}
+    for rel, entry in functions.items():
+        module = entry["module"] or target_module.get(compiled_targets.get(rel))
+        if module:
+            by_name[(module, stats_name(Path(rel).name))] = rel
+
+    files = []
+    unmatched = 0
+    for (module, base), rec in stats.items():
+        rel = by_name.get((module, base))
+        if rel is None:
+            unmatched += 1
+            continue
+        items = sorted(functions.get(rel, {}).get("items", []), key=lambda f: -f["ms"])
+        pct = 100.0 * rec["solver_bytes"] / limit_bytes
+        files.append({
+            "path": rel, "module": module, "scopes": rec["scopes"], "solver_bytes": rec["solver_bytes"],
+            "pct": round(pct, 2), "risk": risk(pct), "functions": items[:3],
+        })
+    files.sort(key=lambda f: (-f["solver_bytes"], -f["scopes"]))
+    top_functions = sorted(
+        ({"path": rel, **f} for rel, e in functions.items() for f in e["items"] if f["ms"] >= min_ms),
+        key=lambda f: -f["ms"],
+    )[:25]
+    return {
+        "tool": "typecheck-budget", "version": VERSION, "mode": mode,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "root": str(root), "swift": version_str, "limit_mb": limit_mb, "limit_note": limit_note,
+        "build_status": status, "compile_tasks": compiled, "files": files,
+        "unmatched_stats": unmatched, "compiled_under_root": len(compiled_targets),
+        "errors": errors, "top_functions": top_functions,
+    }
+
+
+# ---------------------------------------------------------------- output
+
+def print_report(report, top, root, show_hints=True):
+    files = report["files"]
+    print(
+        f"typecheck-budget {report['version']} · Swift {report['swift'] or '?'} · "
+        f"solver memory limit {report['limit_mb']} MB ({report['limit_note']}) · {len(files)} files"
+    )
+    if report["errors"]:
+        print("\nAlready failing:")
+        for e in report["errors"]:
+            print(f"  {e['path']}:{e['line']}  {e['message']}")
+    if not files:
+        print("\nNo statistics were found for files under the root. See the build log.")
+        return
+    print()
+    header = f"{'#':>3}  {'risk':5}  {'solver peak':>12}  {'of limit':>8}  {'scopes':>10}  {'slowest body':>12}  file"
+    print(header)
+    for i, f in enumerate(files[:top], 1):
+        slow = f["functions"][0] if f["functions"] else None
+        slow_s = f"{slow['ms']:,.0f} ms :{slow['line']}" if slow else "-"
+        print(
+            f"{i:>3}  {f['risk']:5}  {fmt_mb(f['solver_bytes']):>12}  {f['pct']:>7.1f}%  "
+            f"{fmt_int(f['scopes']):>10}  {slow_s:>12}  {f['path']}"
+        )
+    high = sum(1 for f in files if f["risk"] == "HIGH")
+    watch = sum(1 for f in files if f["risk"] == "watch")
+    print(f"\nHIGH (>= {HIGH_PCT:.0f}% of the limit): {high} file(s); watch ({WATCH_PCT:.0f}-{HIGH_PCT:.0f}%): {watch} file(s).")
+
+    if report["top_functions"]:
+        print("\nFunction bodies that took 1 s or more to type-check:")
+        for f in report["top_functions"][: min(top, 10)]:
+            print(f"  {f['ms']:>9,.0f} ms  {f['path']}:{f['line']}  {f['name']}")
+
+    if show_hints:
+        shown = False
+        for f in files[:top]:
+            if f["risk"] == "ok":
+                continue
+            found = hints(Path(root) / f["path"])
+            if found:
+                if not shown:
+                    print("\nHints:")
+                    shown = True
+                print(f"  {f['path']}")
+                for h in found:
+                    print(f"    - {h}")
+
+
+def markdown(report, top):
+    lines = [
+        f"**typecheck-budget** · Swift {report['swift'] or '?'} · solver memory limit {report['limit_mb']} MB",
+        "",
+    ]
+    if report["errors"]:
+        lines += ["Already failing:", ""]
+        lines += [f"- `{e['path']}:{e['line']}`" for e in report["errors"]]
+        lines.append("")
+    lines += [
+        "| # | Risk | Solver peak | Of limit | Scopes | Slowest body | File |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for i, f in enumerate(report["files"][:top], 1):
+        slow = f["functions"][0] if f["functions"] else None
+        slow_s = f"{slow['ms']:,.0f} ms (line {slow['line']})" if slow else "-"
+        lines.append(
+            f"| {i} | {f['risk']} | {fmt_mb(f['solver_bytes'])} | {f['pct']:.1f}% | "
+            f"{fmt_int(f['scopes'])} | {slow_s} | `{f['path']}` |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def save(report, work, label):
+    work.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = work / f"{label}-{stamp}.json"
+    path.write_text(json.dumps(report, indent=1, ensure_ascii=False))
+    (work / f"latest-{label}.json").write_text(json.dumps(report, indent=1, ensure_ascii=False))
+    return path
+
+
+def load(path):
+    return json.loads(Path(path).read_text())
+
+
+# ---------------------------------------------------------------- commands
+
+def common_build_options(p):
+    p.add_argument("--root", default=".", help="only files under this folder are reported (default: current folder)")
+    p.add_argument("--work-dir", default=".typecheck-budget",
+                   help="DerivedData, statistics, logs and reports go here (default: ./.typecheck-budget)")
+    p.add_argument("--limit-mb", type=int, help="solver memory limit, if your compiler is not known to the tool")
+    p.add_argument("--top", type=int, default=15, help="rows to print (default 15)")
+    p.add_argument("--no-hints", action="store_true", help="do not print the TCA / navigation hints")
+    p.epilog = "Everything after -- goes to xcodebuild: -project/-workspace, -scheme, -destination, settings."
+
+
+def split_xcodebuild(args):
+    if not args.xcodebuild:
+        sys.exit("pass the xcodebuild arguments after --, for example:\n"
+                 "  typecheck-budget scan -- -scheme MyApp "
+                 "-destination 'platform=iOS Simulator,name=iPhone 18 Pro'")
+
+
+def cmd_scan(args):
+    split_xcodebuild(args)
+    root = Path(args.root).resolve()
+    work = Path(args.work_dir).resolve()
+    version, version_str = swift_version()
+    limit_mb, note = memory_limit_mb(version, args.limit_mb)
+    paths = [str(p) for p in swift_files(root)]
+    eprint(f"{len(paths)} Swift files under {root}")
+    previous = load_seen(work)
+    status, stats_dir, log_path, functions, errors, compiled, targets, applied = build(
+        args, {p: None for p in paths}, root)
+    save_seen(work, root, applied, previous)
+    report = make_report("scan", root, version_str, limit_mb, note, read_stats(stats_dir), functions, errors,
+                         compiled, status, targets)
+    if targets and len(report["files"]) < 0.8 * len(targets):
+        eprint(f"warning: statistics found for {len(report['files'])} of {len(targets)} compiled files; if Swift "
+               "batch mode is still on, the numbers are per batch of files, not per file")
+    out = save(report, work, "scan")
+    print_report(report, args.top, root, not args.no_hints)
+    if args.markdown:
+        Path(args.markdown).write_text(markdown(report, args.top))
+    print(f"\nreport: {out}")
+    if status != 0:
+        print(f"build failed (xcodebuild exit {status}); see {log_path}")
+    if args.fail_above is not None:
+        over = [f for f in report["files"] if f["pct"] >= args.fail_above]
+        if over:
+            print(f"\n{len(over)} file(s) at or above {args.fail_above}% of the solver memory limit")
+            return 2
+    return 0 if status == 0 else 1
+
+
+def cmd_file(args):
+    split_xcodebuild(args)
+    root = Path(args.root).resolve()
+    work = Path(args.work_dir).resolve()
+    target = Path(args.path).resolve()
+    rel = under_root(target, root)
+    if rel is None or not target.exists():
+        sys.exit(f"{args.path} is not a Swift file under {root}")
+    version, version_str = swift_version()
+    limit_mb, note = memory_limit_mb(version, args.limit_mb)
+    previous = load_seen(work)
+    if not previous:
+        eprint("note: no previous scan in the work dir, so this first run builds everything")
+    plan = {}
+    for p in swift_files(root):
+        p = str(p)
+        old = previous.get(p)
+        try:
+            current = os.stat(p).st_mtime_ns
+        except OSError:
+            continue
+        if old and old["real"] == current and old["seen"] != current:
+            plan[p] = old["seen"]
+    plan[str(target)] = None
+    status, stats_dir, log_path, functions, errors, compiled, targets, applied = build(args, plan, root)
+    save_seen(work, root, applied, previous)
+    report = make_report("file", root, version_str, limit_mb, note, read_stats(stats_dir), functions, errors,
+                         compiled, status, targets)
+    mine = next((f for f in report["files"] if f["path"] == rel), None)
+    my_errors = [e for e in report["errors"] if e["path"] == rel]
+    print(f"{rel}  ·  Swift {version_str or '?'}  ·  limit {limit_mb} MB")
+    if mine is None:
+        print("no statistics for this file; was it compiled? see", log_path)
+        return 1
+    previous, prev_label = None, ""
+    candidates = []
+    for name in ("latest-file.json", "latest-scan.json"):
+        p = work / name
+        if p.exists():
+            prev = load(p)
+            hit = next((f for f in prev["files"] if f["path"] == rel), None)
+            if hit:
+                candidates.append((prev["created"], hit, f"{prev['mode']} {prev['created']}"))
+    if candidates:
+        _, previous, prev_label = max(candidates, key=lambda c: c[0])
+    def line(label, now, before, fmt):
+        tail = f"   was {fmt(before)} ({prev_label})" if before is not None else ""
+        print(f"  {label:<13}{fmt(now):>14}{tail}")
+    line("solver peak", mine["solver_bytes"], previous and previous["solver_bytes"], fmt_mb)
+    line("of limit", mine["pct"], previous and previous["pct"], lambda v: f"{v:.1f}%")
+    line("scopes", mine["scopes"], previous and previous["scopes"], fmt_int)
+    print(f"  {'risk':<13}{mine['risk']:>14}")
+    for f in mine["functions"]:
+        print(f"  {f['ms']:>9,.0f} ms  line {f['line']}  {f['name']}")
+    for e in my_errors:
+        print(f"  error at line {e['line']}: {e['message']}")
+    if not args.no_hints and mine["risk"] != "ok":
+        for h in hints(target):
+            print(f"  hint: {h}")
+    report["files"] = [mine]
+    report["errors"] = my_errors
+    save(report, work, "file")
+    return 0 if status == 0 else 1
+
+
+def cmd_compare(args):
+    a, b = load(args.before), load(args.after)
+    A = {f["path"]: f for f in a["files"]}
+    B = {f["path"]: f for f in b["files"]}
+    rows = []
+    for path in set(A) | set(B):
+        x, y = A.get(path), B.get(path)
+        delta = (y["solver_bytes"] if y else 0) - (x["solver_bytes"] if x else 0)
+        rows.append((abs(delta), path, x, y, delta))
+    rows.sort(key=lambda r: -r[0])
+    print(f"before: {args.before}  ({a['created']}, Swift {a['swift']})")
+    print(f"after:  {args.after}  ({b['created']}, Swift {b['swift']})\n")
+    print(f"{'before':>20}  {'after':>20}  {'change':>11}  file")
+    for _, path, x, y, delta in rows[: args.top]:
+        xs = f"{fmt_mb(x['solver_bytes'])} {x['pct']:5.1f}%" if x else "-"
+        ys = f"{fmt_mb(y['solver_bytes'])} {y['pct']:5.1f}%" if y else "-"
+        sign = "+" if delta > 0 else ""
+        print(f"{xs:>20}  {ys:>20}  {sign}{delta / 1e6:>9,.1f} MB  {path}")
+    def worst(r):
+        return max((f["pct"] for f in r["files"]), default=0.0)
+    print(f"\nworst file: {worst(a):.1f}% -> {worst(b):.1f}% of the limit; "
+          f"HIGH files: {sum(f['risk'] == 'HIGH' for f in a['files'])} -> {sum(f['risk'] == 'HIGH' for f in b['files'])}")
+    return 0
+
+
+def cmd_show(args):
+    report = load(args.report)
+    if args.markdown:
+        sys.stdout.write(markdown(report, args.top))
+    else:
+        print_report(report, args.top, report["root"], not args.no_hints)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="typecheck-budget", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("scan", help="build and rank every Swift file under --root")
+    p.add_argument("--fail-above", type=float, metavar="PCT", help="exit 2 if a file reaches PCT%% of the limit")
+    p.add_argument("--markdown", metavar="FILE", help="also write the table as Markdown")
+    common_build_options(p)
+    p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser("file", help="re-measure one file and compare it with the last scan")
+    p.add_argument("path", help="the Swift file")
+    common_build_options(p)
+    p.set_defaults(func=cmd_file)
+
+    p = sub.add_parser("compare", help="diff two saved reports")
+    p.add_argument("before")
+    p.add_argument("after")
+    p.add_argument("--top", type=int, default=15)
+    p.set_defaults(func=cmd_compare)
+
+    p = sub.add_parser("show", help="print a saved report")
+    p.add_argument("report")
+    p.add_argument("--top", type=int, default=15)
+    p.add_argument("--markdown", action="store_true", help="print Markdown instead of the table")
+    p.add_argument("--no-hints", action="store_true")
+    p.set_defaults(func=cmd_show)
+
+    argv = sys.argv[1:]
+    xcodebuild = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, xcodebuild = argv[:i], argv[i + 1:]
+    args = parser.parse_args(argv)
+    args.xcodebuild = xcodebuild
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
